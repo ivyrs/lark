@@ -1,0 +1,19 @@
+# ~/.config/lark/config.toml
+
+# "default" (system device via cpal) or "null" (discard audio, for testing)
+output = "default"
+
+# socket = "/run/user/1000/lark.sock"   # default: $XDG_RUNTIME_DIR/lark.sock
+
+[[plugin]]
+name = "local"
+exec = ["lark-source-local"]           # bare names resolve next to larkd, then $PATH
+[plugin.config]
+music_dir = "~/Music"
+
+# Any executable that speaks the plugin protocol over stdio works:
+# [[plugin]]
+# name = "radio"
+# exec = ["python3", "/path/to/radio_source.py"]
+# [plugin.config]
+# stations = "~/.config/lark/stations.toml"

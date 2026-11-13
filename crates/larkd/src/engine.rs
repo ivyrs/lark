@@ -1,0 +1,598 @@
+//! Playback engine: one dedicated thread that decodes with symphonia and
+//! feeds an `Output`. The next track is pre-opened and decoded straight into
+//! the same ring buffer, so same-spec transitions are gapless. Track
+//! boundaries are announced when they are *heard*, not when decoded.
+
+use std::collections::VecDeque;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::errors::Error as SymError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::Time;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::config::OutputKind;
+use crate::output::{OutShared, Output};
+
+pub enum Cmd {
+    /// Start `id` from `path` at `start_ms`, dropping whatever is buffered.
+    Play {
+        id: u64,
+        path: PathBuf,
+        start_ms: u64,
+    },
+    /// What to roll into when the current track ends (gapless).
+    SetNext(Option<(u64, PathBuf)>),
+    Pause,
+    Resume,
+    Stop,
+    Volume(f32),
+}
+
+#[derive(Debug)]
+pub enum Event {
+    /// `id` became audible at `position_ms`.
+    Started {
+        id: u64,
+        position_ms: u64,
+        duration_ms: Option<u64>,
+    },
+    /// Decoding `id` failed; the core should skip it.
+    Error { id: u64, message: String },
+    /// Queue ran dry and the buffer drained.
+    Finished,
+}
+
+/// What clients need to compute a live position without asking the thread.
+struct Clock {
+    id: u64,
+    base_ms: u64,
+    start_sample: u64,
+    samples_per_sec: u64,
+    shared: Arc<OutShared>,
+}
+
+#[derive(Clone)]
+pub struct EngineHandle {
+    tx: Sender<Cmd>,
+    clock: Arc<Mutex<Option<Clock>>>,
+}
+
+impl EngineHandle {
+    pub fn send(&self, cmd: Cmd) {
+        let _ = self.tx.send(cmd);
+    }
+
+    /// (item id, position ms) of what is audible right now.
+    pub fn position(&self) -> Option<(u64, u64)> {
+        let g = self.clock.lock().unwrap();
+        let c = g.as_ref()?;
+        let consumed = c.shared.consumed.load(std::sync::atomic::Ordering::Acquire);
+        let played = consumed.saturating_sub(c.start_sample);
+        Some((c.id, c.base_ms + played * 1000 / c.samples_per_sec.max(1)))
+    }
+}
+
+pub fn spawn(kind: OutputKind, events: UnboundedSender<Event>) -> EngineHandle {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let clock = Arc::new(Mutex::new(None));
+    let mut eng = Engine {
+        kind,
+        events,
+        clock: clock.clone(),
+        out: None,
+        cur: None,
+        next: None,
+        segments: VecDeque::new(),
+        pend: Vec::new(),
+        pend_pos: 0,
+        scratch: Vec::new(),
+        resampler: None,
+        reopen: None,
+        draining: false,
+        volume: 1.0,
+    };
+    std::thread::Builder::new()
+        .name("lark-engine".into())
+        .spawn(move || eng.run(rx))
+        .expect("spawn engine");
+    EngineHandle { tx, clock }
+}
+
+struct Decoding {
+    id: u64,
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn AudioDecoder>,
+    track_id: u32,
+    rate: u32,
+    channels: usize,
+    duration_ms: Option<u64>,
+    eof: bool,
+}
+
+struct Segment {
+    id: u64,
+    start_sample: u64,
+    base_ms: u64,
+    duration_ms: Option<u64>,
+}
+
+struct Engine {
+    kind: OutputKind,
+    events: UnboundedSender<Event>,
+    clock: Arc<Mutex<Option<Clock>>>,
+    out: Option<Output>,
+    cur: Option<Decoding>,
+    next: Option<(u64, PathBuf)>,
+    /// Segments written to the ring but not yet announced (front = oldest).
+    segments: VecDeque<Segment>,
+    pend: Vec<f32>,
+    pend_pos: usize,
+    scratch: Vec<f32>,
+    resampler: Option<Linear>,
+    /// Next track needs a different output spec; reopen once drained.
+    reopen: Option<Decoding>,
+    draining: bool,
+    volume: f32,
+}
+
+impl Engine {
+    fn run(&mut self, rx: Receiver<Cmd>) {
+        loop {
+            let busy = self.has_work();
+            let timeout = if busy {
+                Duration::from_millis(0)
+            } else {
+                Duration::from_millis(10)
+            };
+            match rx.recv_timeout(timeout) {
+                Ok(cmd) => self.handle(cmd),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            while let Ok(cmd) = rx.try_recv() {
+                self.handle(cmd);
+            }
+            // Fill the ring; yield briefly when it's full.
+            let mut progressed = false;
+            for _ in 0..64 {
+                if !self.pump() {
+                    break;
+                }
+                progressed = true;
+            }
+            self.tick();
+            if busy && !progressed {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        self.out.is_some() && (self.cur.is_some() || self.pend_pos < self.pend.len())
+    }
+
+    fn emit(&self, e: Event) {
+        let _ = self.events.send(e);
+    }
+
+    fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Play { id, path, start_ms } => self.play(id, &path, start_ms),
+            Cmd::SetNext(n) => {
+                self.next = n;
+                // We may already be draining the last track: the new next can
+                // still go in gaplessly.
+                if self.cur.is_none()
+                    && self.reopen.is_none()
+                    && self.draining
+                    && self.next.is_some()
+                {
+                    self.advance();
+                }
+            }
+            Cmd::Pause => {
+                if let Some(o) = &self.out {
+                    o.shared
+                        .paused
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Cmd::Resume => {
+                if let Some(o) = &self.out {
+                    o.shared
+                        .paused
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Cmd::Stop => self.stop(),
+            Cmd::Volume(v) => {
+                self.volume = v.clamp(0.0, 1.5);
+                if let Some(o) = &self.out {
+                    o.shared
+                        .volume
+                        .store(self.volume.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.cur = None;
+        self.next = None;
+        self.reopen = None;
+        self.segments.clear();
+        self.pend.clear();
+        self.pend_pos = 0;
+        self.draining = false;
+        self.out = None; // release the device
+        *self.clock.lock().unwrap() = None;
+    }
+
+    fn play(&mut self, id: u64, path: &Path, start_ms: u64) {
+        let mut dec = match open_decoder(id, path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.stop();
+                self.emit(Event::Error {
+                    id,
+                    message: format!("{e:#}"),
+                });
+                return;
+            }
+        };
+        if start_ms > 0 {
+            dec.seek(start_ms);
+        }
+        self.next = None;
+        self.reopen = None;
+        self.draining = false;
+        self.pend.clear();
+        self.pend_pos = 0;
+        self.segments.clear();
+
+        let reuse = self
+            .out
+            .as_ref()
+            .is_some_and(|o| o.rate == dec.rate && channels_ok(o.channels, dec.channels));
+        if reuse {
+            let o = self.out.as_mut().unwrap();
+            o.flush();
+            o.shared
+                .paused
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.out = None;
+            match Output::open(self.kind, dec.rate, dec.channels, self.volume) {
+                Ok(o) => self.out = Some(o),
+                Err(e) => {
+                    self.emit(Event::Error {
+                        id,
+                        message: format!("output: {e:#}"),
+                    });
+                    return;
+                }
+            }
+        }
+        self.begin(dec, start_ms);
+    }
+
+    /// Make `dec` the decoding track, starting at the current write position.
+    fn begin(&mut self, dec: Decoding, base_ms: u64) {
+        let out = self.out.as_ref().expect("output open");
+        self.resampler =
+            (dec.rate != out.rate).then(|| Linear::new(dec.rate, out.rate, out.channels));
+        self.segments.push_back(Segment {
+            id: dec.id,
+            start_sample: out.written,
+            base_ms,
+            duration_ms: dec.duration_ms,
+        });
+        self.cur = Some(dec);
+    }
+
+    /// Current track hit EOF: roll into `next` if there is one.
+    fn advance(&mut self) {
+        self.cur = None;
+        let Some((id, path)) = self.next.take() else {
+            self.draining = true;
+            return;
+        };
+        self.draining = false;
+        match open_decoder(id, &path) {
+            Ok(dec) => {
+                let out = self.out.as_ref().expect("output open");
+                if out.rate == dec.rate && channels_ok(out.channels, dec.channels) {
+                    self.begin(dec, 0);
+                } else {
+                    self.reopen = Some(dec);
+                }
+            }
+            Err(e) => {
+                self.draining = true;
+                self.emit(Event::Error {
+                    id,
+                    message: format!("{e:#}"),
+                });
+            }
+        }
+    }
+
+    /// Move decoded audio into the ring. Returns true if anything happened.
+    fn pump(&mut self) -> bool {
+        let Some(out) = self.out.as_mut() else {
+            return false;
+        };
+        if self.pend_pos < self.pend.len() {
+            let n = out.push(&self.pend[self.pend_pos..]);
+            self.pend_pos += n;
+            return n > 0;
+        }
+        let Some(dec) = self.cur.as_mut() else {
+            return false;
+        };
+        if dec.eof {
+            self.advance();
+            return true;
+        }
+        match dec.format.next_packet() {
+            Ok(Some(pkt)) => {
+                if pkt.track_id != dec.track_id {
+                    return true;
+                }
+                match dec.decoder.decode(&pkt) {
+                    Ok(buf) => {
+                        buf.copy_to_vec_interleaved(&mut self.scratch);
+                        self.pend.clear();
+                        self.pend_pos = 0;
+                        remix(&self.scratch, dec.channels, out.channels, &mut self.pend);
+                        if let Some(rs) = self.resampler.as_mut() {
+                            let src = std::mem::take(&mut self.pend);
+                            rs.process(&src, &mut self.pend);
+                        }
+                    }
+                    Err(SymError::DecodeError(e)) => {
+                        tracing::debug!("decode error (skipping packet): {e}")
+                    }
+                    Err(e) => {
+                        tracing::warn!("decoder failed: {e}");
+                        dec.eof = true;
+                    }
+                }
+            }
+            Ok(None) => dec.eof = true,
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                dec.eof = true
+            }
+            Err(SymError::ResetRequired) => dec.eof = true,
+            Err(e) => {
+                tracing::warn!("demux failed: {e}");
+                dec.eof = true;
+            }
+        }
+        true
+    }
+
+    /// Announce boundaries that became audible; finish when drained.
+    fn tick(&mut self) {
+        let Some(out) = self.out.as_ref() else { return };
+        let consumed = out.consumed();
+        let sps = out.rate as u64 * out.channels as u64;
+
+        while let Some(seg) = self.segments.front() {
+            if consumed < seg.start_sample {
+                break;
+            }
+            let seg = self.segments.pop_front().unwrap();
+            *self.clock.lock().unwrap() = Some(Clock {
+                id: seg.id,
+                base_ms: seg.base_ms,
+                start_sample: seg.start_sample,
+                samples_per_sec: sps,
+                shared: out.shared.clone(),
+            });
+            self.emit(Event::Started {
+                id: seg.id,
+                position_ms: seg.base_ms,
+                duration_ms: seg.duration_ms,
+            });
+        }
+
+        let drained = out.drained() && self.pend_pos >= self.pend.len();
+        if drained {
+            if let Some(dec) = self.reopen.take() {
+                self.out = None;
+                match Output::open(self.kind, dec.rate, dec.channels, self.volume) {
+                    Ok(o) => {
+                        self.out = Some(o);
+                        self.begin(dec, 0);
+                    }
+                    Err(e) => self.emit(Event::Error {
+                        id: dec.id,
+                        message: format!("output: {e:#}"),
+                    }),
+                }
+            } else if self.draining && self.cur.is_none() {
+                self.draining = false;
+                self.stop();
+                self.emit(Event::Finished);
+            }
+        }
+    }
+}
+
+fn channels_ok(out: usize, src: usize) -> bool {
+    out == src || (out == 2 && src <= 2)
+}
+
+fn open_decoder(id: u64, path: &Path) -> Result<Decoding> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .context("unrecognised format")?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .context("no audio track")?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .context("no audio codec parameters")?
+        .clone();
+    let track_id = track.id;
+    let rate = params.sample_rate.context("unknown sample rate")?;
+    let channels = params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(2)
+        .max(1);
+    let duration_ms = track.num_frames.map(|n| n * 1000 / rate as u64);
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .context("unsupported codec")?;
+    Ok(Decoding {
+        id,
+        format,
+        decoder,
+        track_id,
+        rate,
+        channels,
+        duration_ms,
+        eof: false,
+    })
+}
+
+impl Decoding {
+    fn seek(&mut self, ms: u64) {
+        let Some(time) = Time::try_from_secs_f64(ms as f64 / 1000.0) else {
+            return;
+        };
+        match self.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            },
+        ) {
+            Ok(_) => self.decoder.reset(),
+            Err(e) => tracing::warn!("seek failed: {e}"),
+        }
+    }
+}
+
+/// Map `src_ch` interleaved audio onto `out_ch` channels.
+fn remix(src: &[f32], src_ch: usize, out_ch: usize, dst: &mut Vec<f32>) {
+    if src_ch == out_ch {
+        dst.extend_from_slice(src);
+        return;
+    }
+    let frames = src.len() / src_ch;
+    dst.reserve(frames * out_ch);
+    for f in src.chunks_exact(src_ch) {
+        if out_ch == 1 {
+            dst.push(f.iter().sum::<f32>() / src_ch as f32);
+        } else if src_ch == 1 {
+            dst.extend(std::iter::repeat_n(f[0], out_ch));
+        } else {
+            // TODO: proper downmix matrices (5.1 → stereo etc.)
+            for c in 0..out_ch {
+                dst.push(f[c % src_ch]);
+            }
+        }
+    }
+}
+
+/// Minimal streaming linear resampler, used only when the device can't run
+/// at the track's native rate. Swap for a windowed-sinc one later.
+struct Linear {
+    step: f64,
+    t: f64,
+    ch: usize,
+    last: Vec<f32>,
+    primed: bool,
+}
+
+impl Linear {
+    fn new(from: u32, to: u32, ch: usize) -> Self {
+        Self {
+            step: from as f64 / to as f64,
+            t: 0.0,
+            ch,
+            last: vec![0.0; ch],
+            primed: false,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let ch = self.ch;
+        let n = input.len() / ch;
+        if n == 0 {
+            return;
+        }
+        if !self.primed {
+            self.last.copy_from_slice(&input[..ch]);
+            self.primed = true;
+        }
+        // Virtual sequence: [last, input[0], …, input[n-1]] → n+1 frames.
+        let frame = |i: usize, c: usize| {
+            if i == 0 {
+                self.last[c]
+            } else {
+                input[(i - 1) * ch + c]
+            }
+        };
+        while self.t < n as f64 {
+            let i = self.t.floor() as usize;
+            let frac = (self.t - i as f64) as f32;
+            for c in 0..ch {
+                let a = frame(i, c);
+                let b = frame(i + 1, c);
+                out.push(a + (b - a) * frac);
+            }
+            self.t += self.step;
+        }
+        self.t -= n as f64;
+        self.last.copy_from_slice(&input[(n - 1) * ch..n * ch]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remix_mono_to_stereo() {
+        let mut d = vec![];
+        remix(&[0.1, 0.2], 1, 2, &mut d);
+        assert_eq!(d, [0.1, 0.1, 0.2, 0.2]);
+    }
+
+    #[test]
+    fn resampler_ratio() {
+        let mut r = Linear::new(48_000, 44_100, 1);
+        let input = vec![0.5f32; 48_000];
+        let mut out = vec![];
+        r.process(&input, &mut out);
+        assert!((out.len() as i64 - 44_100).abs() < 3, "{}", out.len());
+    }
+}
