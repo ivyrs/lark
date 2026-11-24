@@ -79,6 +79,7 @@ impl Plugin {
             },
             InitializeResult {
                 name: "local".into(),
+                role: lark_protocol::PluginRole::Source,
                 scheme: SCHEME.into(),
                 cache: CacheMode::Full,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -96,12 +97,9 @@ impl Plugin {
 
     fn pull(&mut self, p: SyncPull) -> Result<SyncBatch> {
         if self.session.is_none() {
-            // No cursor means the core has nothing from us: forget our index so
-            // everything is reported again.
-            if p.cursor.is_none() {
-                self.index.clear();
-            }
-            self.session = Some(self.diff()?);
+            // No cursor means the core has nothing from us: report everything
+            // again, but keep the committed index intact if scanning fails.
+            self.session = Some(self.diff(p.cursor.is_none())?);
         }
         let s = self.session.as_mut().unwrap();
 
@@ -138,17 +136,19 @@ impl Plugin {
         })
     }
 
-    fn diff(&self) -> Result<Session> {
+    fn diff(&self, full_sync: bool) -> Result<Session> {
         let mut new_index = BTreeMap::new();
         let mut pending_upserts = VecDeque::new();
-        if !self.root.is_dir() {
-            log(&format!("music_dir {} does not exist", self.root.display()));
-        }
-        for entry in walkdir::WalkDir::new(&self.root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        let root_metadata = std::fs::metadata(&self.root)
+            .with_context(|| format!("reading music_dir {}", self.root.display()))?;
+        anyhow::ensure!(
+            root_metadata.is_dir(),
+            "music_dir {} is not a directory",
+            self.root.display()
+        );
+        for entry in walkdir::WalkDir::new(&self.root).follow_links(true) {
+            let entry =
+                entry.with_context(|| format!("scanning music_dir {}", self.root.display()))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -166,12 +166,13 @@ impl Plugin {
             let Some(rel) = rel.to_str() else { continue };
             let mtime = entry
                 .metadata()
+                .with_context(|| format!("reading metadata for {}", path.display()))?
+                .modified()
                 .ok()
-                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if self.index.get(rel) != Some(&mtime) {
+            if full_sync || self.index.get(rel) != Some(&mtime) {
                 pending_upserts.push_back(rel.to_string());
             }
             new_index.insert(rel.to_string(), mtime);
@@ -179,7 +180,7 @@ impl Plugin {
         let pending_deletes = self
             .index
             .keys()
-            .filter(|k| !new_index.contains_key(*k))
+            .filter(|k| !full_sync && !new_index.contains_key(*k))
             .map(|k| Self::uri(k))
             .collect::<Vec<_>>();
         log(&format!(
@@ -349,4 +350,139 @@ fn main() {
         }
     }
     // stdin closed → core went away.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "lark-local-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("creating test directory: {e}"),
+                }
+            }
+        }
+
+        fn plugin(&self) -> Plugin {
+            let root = self.0.join("music");
+            std::fs::create_dir(&root).unwrap();
+            let state_file = self.0.join("index.json");
+            let index = BTreeMap::from([("existing.flac".to_string(), 123)]);
+            std::fs::write(&state_file, serde_json::to_vec(&index).unwrap()).unwrap();
+            Plugin {
+                root,
+                state_file,
+                index,
+                session: None,
+            }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_failed_scan_preserves_state(plugin: &mut Plugin) {
+        let index = plugin.index.clone();
+        let saved = std::fs::read(&plugin.state_file).unwrap();
+        for cursor in [Some("previous".to_string()), None] {
+            assert!(plugin.pull(SyncPull { cursor }).is_err());
+            assert_eq!(plugin.index, index);
+            assert!(plugin.session.is_none());
+            assert_eq!(std::fs::read(&plugin.state_file).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn missing_root_preserves_index_and_can_be_retried() {
+        let tmp = TempDir::new();
+        let mut plugin = tmp.plugin();
+        std::fs::remove_dir(&plugin.root).unwrap();
+        assert_failed_scan_preserves_state(&mut plugin);
+
+        // A genuinely empty directory still reports deletions after recovery.
+        std::fs::create_dir(&plugin.root).unwrap();
+        let batch = plugin
+            .pull(SyncPull {
+                cursor: Some("previous".to_string()),
+            })
+            .unwrap();
+        assert!(batch.done);
+        assert_eq!(batch.deletes, vec![Plugin::uri("existing.flac")]);
+        assert!(plugin.index.is_empty());
+    }
+
+    #[test]
+    fn non_directory_root_preserves_index() {
+        let tmp = TempDir::new();
+        let mut plugin = tmp.plugin();
+        std::fs::remove_dir(&plugin.root).unwrap();
+        std::fs::write(&plugin.root, b"not a directory").unwrap();
+        assert_failed_scan_preserves_state(&mut plugin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_error_preserves_index() {
+        let tmp = TempDir::new();
+        let mut plugin = tmp.plugin();
+        // A loop reliably produces a WalkDir error, even when tests run as root.
+        std::os::unix::fs::symlink(&plugin.root, plugin.root.join("loop")).unwrap();
+        assert_failed_scan_preserves_state(&mut plugin);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_still_follows_directory_symlinks() {
+        let tmp = TempDir::new();
+        let plugin = tmp.plugin();
+        let target = tmp.0.join("linked-music");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("track.flac"), b"scan only").unwrap();
+        std::os::unix::fs::symlink(&target, plugin.root.join("linked")).unwrap();
+        let session = plugin.diff(false).unwrap();
+        assert!(session.new_index.contains_key("linked/track.flac"));
+        assert!(session
+            .pending_upserts
+            .contains(&"linked/track.flac".to_string()));
+    }
+
+    #[test]
+    fn full_scan_replays_unchanged_files_without_deleting_old_index_entries() {
+        let tmp = TempDir::new();
+        let mut plugin = tmp.plugin();
+        std::fs::write(plugin.root.join("existing.flac"), b"scan only").unwrap();
+        plugin.index = plugin.diff(false).unwrap().new_index;
+        plugin.index.insert("missing.flac".to_string(), 123);
+
+        let incremental = plugin.diff(false).unwrap();
+        assert!(incremental.pending_upserts.is_empty());
+        assert_eq!(
+            incremental.pending_deletes,
+            vec![Plugin::uri("missing.flac")]
+        );
+
+        let full = plugin.diff(true).unwrap();
+        assert_eq!(
+            full.pending_upserts,
+            VecDeque::from(["existing.flac".to_string()])
+        );
+        assert!(full.pending_deletes.is_empty());
+        assert_eq!(plugin.index.len(), 2);
+    }
 }

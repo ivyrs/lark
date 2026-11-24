@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::db::Library;
-use crate::engine::{Cmd, EngineHandle, Event as EngineEvent};
+use crate::engine::{Cmd, EngineHandle, Event as EngineEvent, StampedEvent};
 use crate::plugin::Plugins;
 
 pub enum CoreMsg {
@@ -22,7 +22,7 @@ pub enum CoreMsg {
         params: Value,
         reply: oneshot::Sender<Result<Value>>,
     },
-    Engine(EngineEvent),
+    Engine(StampedEvent),
 }
 
 struct ActivePlay {
@@ -44,6 +44,7 @@ pub struct Core {
     player: PlayerState,
     next_sent: Option<u64>,
     active: Option<ActivePlay>,
+    volume: f32,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +90,7 @@ impl Core {
             player: PlayerState::default(),
             next_sent: None,
             active: None,
+            volume: 1.0,
         }
     }
 
@@ -104,8 +106,10 @@ impl Core {
                     let _ = reply.send(r);
                 }
                 CoreMsg::Engine(ev) => {
-                    if let Err(e) = self.on_engine(ev).await {
-                        tracing::warn!("engine event handling: {e:#}");
+                    if let Some(ev) = ev.into_current() {
+                        if let Err(e) = self.on_engine(ev).await {
+                            tracing::warn!("engine event handling: {e:#}");
+                        }
                     }
                 }
             }
@@ -146,11 +150,8 @@ impl Core {
         self.emit("player.state", &self.player);
     }
 
-    async fn resolve_path(&self, uri: &str) -> Result<std::path::PathBuf> {
-        match self.plugins.resolve(uri).await? {
-            Stream::File { path } => Ok(path.into()),
-            Stream::Http { .. } => bail!("http streams are not supported yet"),
-        }
+    async fn resolve_stream(&self, uri: &str) -> Result<Stream> {
+        self.plugins.resolve(uri).await
     }
 
     async fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -159,6 +160,7 @@ impl Core {
             "status" => serde_json::to_value(Status {
                 player: self.snapshot(),
                 queue: self.queue.clone(),
+                volume: self.volume,
             })?,
             "player.play" => {
                 let pp: PlayParams = serde_json::from_value(p(params))?;
@@ -204,7 +206,12 @@ impl Core {
             }
             "player.volume" => {
                 let vp: VolumeParams = serde_json::from_value(params)?;
-                self.engine.send(Cmd::Volume(vp.volume));
+                if !vp.volume.is_finite() {
+                    bail!("volume must be finite");
+                }
+                self.volume = vp.volume.clamp(0.0, 1.5);
+                self.engine.send(Cmd::Volume(self.volume));
+                self.emit("player.volume", json!({ "volume": self.volume }));
                 Value::Null
             }
             "queue.add" => {
@@ -217,6 +224,7 @@ impl Core {
                 Value::Null
             }
             "queue.clear" => {
+                self.current = None;
                 self.stop();
                 self.queue.clear();
                 self.emit("queue.cleared", json!({}));
@@ -258,7 +266,7 @@ impl Core {
             .idx(id)
             .ok_or_else(|| anyhow!("unknown queue item {id}"))?;
         let uri = self.queue[i].track.uri.clone();
-        let path = match self.resolve_path(&uri).await {
+        let stream = match self.resolve_stream(&uri).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("cannot resolve {uri}: {e:#}");
@@ -268,7 +276,11 @@ impl Core {
         if self.current != Some(id) {
             self.close_play(false);
         }
-        self.engine.send(Cmd::Play { id, path, start_ms });
+        self.engine.send(Cmd::Play {
+            id,
+            stream,
+            start_ms,
+        });
         self.next_sent = None;
         self.current = Some(id);
         self.state = PlayState::Playing;
@@ -363,8 +375,8 @@ impl Core {
         let cmd = match want {
             Some(id) => {
                 let uri = self.queue[self.idx(id).unwrap()].track.uri.clone();
-                match self.resolve_path(&uri).await {
-                    Ok(path) => Some((id, path)),
+                match self.resolve_stream(&uri).await {
+                    Ok(stream) => Some((id, stream)),
                     Err(e) => {
                         tracing::warn!("cannot pre-resolve {uri}: {e:#}");
                         None
@@ -421,6 +433,14 @@ impl Core {
     async fn remove(&mut self, ids: Vec<u64>) -> Result<()> {
         let cur_idx = self.current.and_then(|c| self.idx(c));
         let removing_current = self.current.is_some_and(|c| ids.contains(&c));
+        // Find the successor in the original order: removals before the current
+        // item must not shift which surviving item we continue with.
+        let successor = cur_idx.and_then(|i| {
+            self.queue[i + 1..]
+                .iter()
+                .find(|q| !ids.contains(&q.id))
+                .map(|q| q.id)
+        });
         self.queue.retain(|q| !ids.contains(&q.id));
         self.emit("queue.removed", QueueRemoved { ids });
         if removing_current {
@@ -428,8 +448,8 @@ impl Core {
             self.current = None;
             self.stop();
             if was_playing {
-                // Continue with whatever slid into the removed slot.
-                if let Some(id) = cur_idx.and_then(|i| self.queue.get(i)).map(|q| q.id) {
+                // Continue with the first surviving item after the old current.
+                if let Some(id) = successor {
                     self.start(id, 0).await?;
                 }
             }
@@ -509,5 +529,124 @@ impl Core {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OutputKind;
+
+    fn fixture(state: PlayState, current: u64) -> Core {
+        let lib = Arc::new(Mutex::new(Library::memory().unwrap()));
+        let (plugin_tx, _) = mpsc::unbounded_channel();
+        let plugins = Plugins::start(&[], plugin_tx);
+        let (engine_tx, _) = mpsc::unbounded_channel();
+        let engine = crate::engine::spawn(OutputKind::Null, engine_tx);
+        let (events, _) = broadcast::channel(16);
+        let mut core = Core::new(lib, plugins, engine, events);
+        core.queue = (1..=6)
+            .map(|id| QueueItem {
+                id,
+                track: Track {
+                    uri: format!("test:{id}"),
+                    title: format!("Track {id}"),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        core.next_id = 7;
+        core.current = Some(current);
+        core.state = state;
+        core
+    }
+
+    #[tokio::test]
+    async fn clear_drops_current_and_play_selects_new_first_item() {
+        for state in [PlayState::Playing, PlayState::Paused, PlayState::Stopped] {
+            let mut core = fixture(state, 3);
+            let mut events = core.events.subscribe();
+            core.rpc("queue.clear", Value::Null).await.unwrap();
+            assert!(core.queue.is_empty());
+            assert_eq!(core.current, None);
+            assert_eq!(core.snapshot().current, None);
+            assert_eq!(core.state, PlayState::Stopped);
+            let event = events.try_recv().unwrap();
+            assert_eq!(event.method, "player.state");
+            let player: PlayerState = serde_json::from_value(event.params).unwrap();
+            assert_eq!(player.current, None);
+            core.rpc("queue.add", json!({"uris": ["test:new"]}))
+                .await
+                .unwrap();
+            // The fixture has no source. Reaching its resolver for the new URI
+            // proves default play selected it rather than the deleted item id.
+            let error = core.rpc("player.play", Value::Null).await.unwrap_err();
+            assert_eq!(error.to_string(), "no running source for test:new");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_remove_selects_first_surviving_successor_in_original_order() {
+        for (removed, successor) in [(vec![1, 3], 4), (vec![1, 3, 4], 5)] {
+            let mut core = fixture(PlayState::Playing, 3);
+            let error = core.remove(removed.clone()).await.unwrap_err();
+            // No source is installed: the resolver error identifies exactly
+            // which successor playback tried to start, without audio or a plugin.
+            assert_eq!(
+                error.to_string(),
+                format!("no running source for test:{successor}")
+            );
+            assert!(core.queue.iter().all(|item| !removed.contains(&item.id)));
+            assert_eq!(core.current, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_current_without_successor_or_while_paused_stops() {
+        for (state, removed) in [
+            (PlayState::Playing, vec![1, 3, 4, 5, 6]),
+            (PlayState::Paused, vec![1, 3]),
+            (PlayState::Stopped, vec![1, 3]),
+        ] {
+            let mut core = fixture(state, 3);
+            core.remove(removed).await.unwrap();
+            assert_eq!(core.current, None);
+            assert_eq!(core.state, PlayState::Stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn volume_is_shared_in_status_and_emits_a_typed_change() {
+        let mut core = fixture(PlayState::Stopped, 3);
+        let mut events = core.events.subscribe();
+        core.rpc("player.volume", json!({"volume": 0.15}))
+            .await
+            .unwrap();
+        let status: Status =
+            serde_json::from_value(core.rpc("status", Value::Null).await.unwrap()).unwrap();
+        assert!((status.volume - 0.15).abs() < f32::EPSILON);
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.method, "player.volume");
+        assert!((event.params["volume"].as_f64().unwrap() - 0.15).abs() < 0.00001);
+        core.rpc("player.volume", json!({"volume": 2.0}))
+            .await
+            .unwrap();
+        assert_eq!(core.volume, 1.5);
+        core.rpc("player.volume", json!({"volume": -1.0}))
+            .await
+            .unwrap();
+        assert_eq!(core.volume, 0.0);
+        assert!(core
+            .rpc("player.volume", json!({"volume": null}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_still_retains_current_for_replay() {
+        let mut core = fixture(PlayState::Playing, 3);
+        core.rpc("player.stop", Value::Null).await.unwrap();
+        assert_eq!(core.current, Some(3));
+        assert_eq!(core.state, PlayState::Stopped);
     }
 }

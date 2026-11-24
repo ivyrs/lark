@@ -1,4 +1,4 @@
-//! Wire types shared by the daemon, clients and source plugins.
+//! Wire types shared by the daemon, clients and plugins.
 //!
 //! Transport is newline-delimited JSON-RPC-ish messages, both on the client
 //! socket and on plugin stdio. Either side may send requests; notifications
@@ -147,23 +147,28 @@ impl Track {
 //   player.play      {index?}                        → null
 //   player.pause / player.resume / player.toggle / player.stop / player.next / player.prev
 //   player.seek      {position_ms}                   → null
+//   player.volume    {volume}                        → null (0.0–1.0)
 //   queue.add        {uris, position?, play?}        → [QueueItem]
 //   queue.remove     {ids}                           → null
 //   queue.clear      {}                              → null
 //   library.search   {query, limit?}                 → [Track]
 //   library.artists  {}                              → [ArtistRef]
 //   library.releases {artist_id?}                    → [ReleaseRef]
-//   library.tracks   {release_id? | artist_id?}      → [Track]
+//   library.tracks   {release_id | artist_id}        → [Track]
+//   library.tracks   {limit?, after_uri?}              → [Track] ordered by URI
+//                    (default limit 200, max 1000; cursor = last track URI)
 //   library.sync     {}                              → null
 //   sources          {}                              → [SourceInfo]
 //   history          {limit?}                        → [Play]
 //
 // Events (notifications after `subscribe`):
 //   player.state     PlayerState
+//   player.volume    {volume}
 //   queue.inserted   {position, items}
 //   queue.removed    {ids}
 //   queue.cleared    {}
 //   library.updated  {source}
+//   resync           {missed} (a subscriber fell behind; fetch a fresh snapshot)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -219,6 +224,12 @@ pub struct QueueItem {
 pub struct Status {
     pub player: PlayerState,
     pub queue: Vec<QueueItem>,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+}
+
+fn default_volume() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,23 +281,37 @@ pub struct QueueRemoved {
 //
 // core → plugin requests:
 //   initialize  InitializeParams            → InitializeResult
-//   sync.pull   {cursor?}                   → SyncBatch      (cache = full)
-//   resolve     {uri}                       → Stream
-//   search      {query, limit}              → [Track]        (cache = partial | none)
 //   shutdown    {}                          → null
+//   sync.pull   {cursor?}                   → SyncBatch      (source, cache = full)
+//   resolve     {uri}                       → Stream         (source)
+//   search      {query, limit}              → [Track]        (source, cache = partial | none)
+//
+// After replying to initialize, frontend plugins can send client API requests
+// on their stdout and receive responses and subscribed client events on stdin.
+// Request IDs are independent in each direction. Source plugins do not call
+// the client API.
 //
 // plugin → core notifications:
 //   sync.dirty  {}                          the core should pull again
 //   log         {level, message}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginRole {
+    #[default]
+    Source,
+    Frontend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheMode {
     /// Core mirrors the whole catalogue via `sync.pull`.
     Full,
     /// Core caches only tracks that get queued / played / saved.
     Partial,
-    /// Nothing cached; the source answers `search` live.
+    /// Nothing cached; a source answers `search` live.
+    #[default]
     None,
 }
 
@@ -301,8 +326,12 @@ pub struct InitializeParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeResult {
     pub name: String,
-    /// URI scheme this plugin owns, e.g. `local` → `local:track:…`.
+    #[serde(default)]
+    pub role: PluginRole,
+    /// URI scheme this source owns, e.g. `local` → `local:track:…`.
+    #[serde(default)]
     pub scheme: String,
+    #[serde(default)]
     pub cache: CacheMode,
     pub version: String,
 }
@@ -391,6 +420,37 @@ mod tests {
             serde_json::from_str::<Message>(note).unwrap(),
             Message::Notification(_)
         ));
+    }
+
+    #[test]
+    fn initialize_roles_are_backwards_compatible() {
+        let source: InitializeResult = serde_json::from_str(
+            r#"{"name":"local","scheme":"local","cache":"full","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(source.role, PluginRole::Source);
+        assert_eq!(source.cache, CacheMode::Full);
+        let frontend: InitializeResult =
+            serde_json::from_str(r#"{"name":"mpd","role":"frontend","version":"0.1.0"}"#).unwrap();
+        assert_eq!(frontend.role, PluginRole::Frontend);
+        assert!(frontend.scheme.is_empty());
+        assert_eq!(frontend.cache, CacheMode::None);
+    }
+
+    #[test]
+    fn old_status_defaults_to_full_volume() {
+        let mut status = serde_json::json!({ "player": PlayerState::default(), "queue": [] });
+        assert_eq!(
+            serde_json::from_value::<Status>(status.clone())
+                .unwrap()
+                .volume,
+            1.0
+        );
+        status["volume"] = serde_json::json!(0.5);
+        assert_eq!(
+            serde_json::from_value::<Status>(status).unwrap().volume,
+            0.5
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod config;
 mod core;
 mod db;
 mod engine;
+mod http;
 mod output;
 mod plugin;
 mod server;
@@ -11,9 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use lark_protocol::{CacheMode, Notification, SyncBatch, SyncPull};
+use lark_protocol::{CacheMode, Notification, PluginRole, SyncBatch, SyncPull};
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
+use tracing_subscriber::prelude::*;
 
 use crate::config::{Config, OutputKind};
 use crate::core::{Core, CoreMsg};
@@ -42,12 +44,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Signed media URLs and authentication headers must not leak even when a
+    // caller enables dependency trace logging through LARK_LOG.
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_env("LARK_LOG")
                 .unwrap_or_else(|_| "info".into()),
         )
-        .with_writer(std::io::stderr)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    safe_log_target(metadata.target())
+                })),
+        )
         .init();
 
     let args = Args::parse();
@@ -69,9 +79,16 @@ async fn main() -> Result<()> {
         .db
         .unwrap_or_else(|| config::data_dir().join("library.db"));
 
-    let lib = Arc::new(Mutex::new(
-        Library::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?,
-    ));
+    let mut library =
+        Library::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    let configured: Vec<_> = cfg
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.enabled)
+        .map(|plugin| plugin.name.clone())
+        .collect();
+    library.set_enabled_sources(&configured)?;
+    let lib = Arc::new(Mutex::new(library));
     let (events_tx, _) = broadcast::channel::<Notification>(1024);
 
     let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
@@ -106,6 +123,7 @@ async fn main() -> Result<()> {
         events: events_tx,
         sync: sync_tx,
     };
+    plugins.attach_frontend(ctx.clone());
     let sock = socket.clone();
     tracing::info!(output = ?cfg.output, db = %db_path.display(), "larkd starting");
 
@@ -116,6 +134,13 @@ async fn main() -> Result<()> {
     plugins.shutdown().await;
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+fn safe_log_target(target: &str) -> bool {
+    !matches!(
+        target.split("::").next(),
+        Some("reqwest" | "hyper" | "hyper_util" | "h2" | "rustls" | "rustls_platform_verifier")
+    )
 }
 
 async fn shutdown_signal() {
@@ -140,6 +165,19 @@ async fn sync_loop(
         let targets: Vec<String> = tokio::select! {
             Some(ev) = plugin_rx.recv() => match ev {
                 PluginEvent::Ready { name, info } => {
+                    if info.role == PluginRole::Frontend {
+                        match lib.lock().unwrap().hide_source(&name) {
+                            Ok(true) => {
+                                let _ = events.send(Notification {
+                                    method: "library.updated".into(),
+                                    params: json!({ "source": name, "visibility_changed": true }),
+                                });
+                            }
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!("filter frontend catalogue: {error:#}"),
+                        }
+                        continue;
+                    }
                     if let Err(e) = lib.lock().unwrap().register_source(&name, &info.scheme, info.cache) {
                         tracing::warn!("register source {name}: {e:#}");
                     }
@@ -209,4 +247,24 @@ async fn sync_source(
     }
     let _ = cursor;
     Ok((up, del))
+}
+
+#[cfg(test)]
+mod logging_tests {
+    #[test]
+    fn transport_targets_are_never_logged_but_core_logs_remain_available() {
+        for target in [
+            "reqwest",
+            "reqwest::async_impl::client",
+            "hyper::proto",
+            "hyper_util::client",
+            "h2",
+            "rustls::client",
+            "rustls_platform_verifier",
+        ] {
+            assert!(!super::safe_log_target(target));
+        }
+        assert!(super::safe_log_target("larkd::http"));
+        assert!(super::safe_log_target("larkd::core"));
+    }
 }

@@ -177,6 +177,7 @@ impl App {
                 if let Ok(s) = serde_json::from_value::<Status>(v) {
                     self.player = s.player;
                     self.queue = s.queue;
+                    self.volume = s.volume;
                     self.clamp_queue();
                 }
             }
@@ -232,6 +233,11 @@ impl App {
             "player.state" => {
                 if let Ok(p) = serde_json::from_value(params) {
                     self.player = p;
+                }
+            }
+            "player.volume" => {
+                if let Some(volume) = params.get("volume").and_then(Value::as_f64) {
+                    self.volume = volume as f32;
                 }
             }
             "queue.inserted" => {

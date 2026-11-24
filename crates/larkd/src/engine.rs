@@ -5,33 +5,35 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use lark_protocol::Stream;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::config::OutputKind;
+use crate::http::{cancelled, HttpTransport, Playback};
 use crate::output::{OutShared, Output};
 
 pub enum Cmd {
-    /// Start `id` from `path` at `start_ms`, dropping whatever is buffered.
+    /// Start `id` from `stream` at `start_ms`, dropping whatever is buffered.
     Play {
         id: u64,
-        path: PathBuf,
+        stream: Stream,
         start_ms: u64,
     },
     /// What to roll into when the current track ends (gapless).
-    SetNext(Option<(u64, PathBuf)>),
+    SetNext(Option<(u64, Stream)>),
     Pause,
     Resume,
     Stop,
@@ -52,6 +54,29 @@ pub enum Event {
     Finished,
 }
 
+/// An event queued before a replacement Play/Stop can reach the core after
+/// that command. Check its generation in the core actor before handling it.
+pub struct StampedEvent {
+    event: Event,
+    playback: Playback,
+}
+
+impl StampedEvent {
+    pub fn into_current(self) -> Option<Event> {
+        (!cancelled(&self.playback)).then_some(self.event)
+    }
+}
+
+struct Message {
+    cmd: Cmd,
+    playback: Option<Playback>,
+}
+
+struct Submit {
+    tx: Sender<Message>,
+    playback: watch::Sender<()>,
+}
+
 /// What clients need to compute a live position without asking the thread.
 struct Clock {
     id: u64,
@@ -63,13 +88,20 @@ struct Clock {
 
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: Sender<Cmd>,
+    submit: Arc<Mutex<Submit>>,
     clock: Arc<Mutex<Option<Clock>>>,
 }
 
 impl EngineHandle {
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.tx.send(cmd);
+        // Serialize the notification and queue insertion with all senders. A
+        // replacement cancels even a Play command not yet read by the engine.
+        let submit = self.submit.lock().unwrap();
+        if matches!(cmd, Cmd::Play { .. } | Cmd::Stop) {
+            submit.playback.send_replace(());
+        }
+        let playback = matches!(cmd, Cmd::Play { .. }).then(|| submit.playback.subscribe());
+        let _ = submit.tx.send(Message { cmd, playback });
     }
 
     /// (item id, position ms) of what is audible right now.
@@ -82,12 +114,15 @@ impl EngineHandle {
     }
 }
 
-pub fn spawn(kind: OutputKind, events: UnboundedSender<Event>) -> EngineHandle {
+pub fn spawn(kind: OutputKind, events: UnboundedSender<StampedEvent>) -> EngineHandle {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (submit_playback, playback) = watch::channel(());
     let clock = Arc::new(Mutex::new(None));
     let mut eng = Engine {
         kind,
         events,
+        playback,
+        http: HttpTransport::new(tokio::runtime::Handle::current()),
         clock: clock.clone(),
         out: None,
         cur: None,
@@ -105,7 +140,13 @@ pub fn spawn(kind: OutputKind, events: UnboundedSender<Event>) -> EngineHandle {
         .name("lark-engine".into())
         .spawn(move || eng.run(rx))
         .expect("spawn engine");
-    EngineHandle { tx, clock }
+    EngineHandle {
+        submit: Arc::new(Mutex::new(Submit {
+            tx,
+            playback: submit_playback,
+        })),
+        clock,
+    }
 }
 
 struct Decoding {
@@ -116,6 +157,7 @@ struct Decoding {
     rate: u32,
     channels: usize,
     duration_ms: Option<u64>,
+    http_seekable: Option<bool>,
     eof: bool,
 }
 
@@ -128,11 +170,13 @@ struct Segment {
 
 struct Engine {
     kind: OutputKind,
-    events: UnboundedSender<Event>,
+    events: UnboundedSender<StampedEvent>,
+    playback: Playback,
+    http: HttpTransport,
     clock: Arc<Mutex<Option<Clock>>>,
     out: Option<Output>,
     cur: Option<Decoding>,
-    next: Option<(u64, PathBuf)>,
+    next: Option<(u64, Stream)>,
     /// Segments written to the ring but not yet announced (front = oldest).
     segments: VecDeque<Segment>,
     pend: Vec<f32>,
@@ -146,7 +190,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn run(&mut self, rx: Receiver<Cmd>) {
+    fn run(&mut self, rx: Receiver<Message>) {
         loop {
             let busy = self.has_work();
             let timeout = if busy {
@@ -182,13 +226,30 @@ impl Engine {
     }
 
     fn emit(&self, e: Event) {
-        let _ = self.events.send(e);
+        if !cancelled(&self.playback) {
+            let _ = self.events.send(StampedEvent {
+                event: e,
+                playback: self.playback.clone(),
+            });
+        }
     }
 
-    fn handle(&mut self, cmd: Cmd) {
-        match cmd {
-            Cmd::Play { id, path, start_ms } => self.play(id, &path, start_ms),
+    fn handle(&mut self, msg: Message) {
+        match msg.cmd {
+            Cmd::Play {
+                id,
+                stream,
+                start_ms,
+            } => {
+                self.playback = msg.playback.expect("Play has a playback generation");
+                if !cancelled(&self.playback) {
+                    self.play(id, &stream, start_ms);
+                }
+            }
             Cmd::SetNext(n) => {
+                if cancelled(&self.playback) {
+                    return;
+                }
                 self.next = n;
                 // We may already be draining the last track: the new next can
                 // still go in gaplessly.
@@ -238,27 +299,29 @@ impl Engine {
         *self.clock.lock().unwrap() = None;
     }
 
-    fn play(&mut self, id: u64, path: &Path, start_ms: u64) {
-        let mut dec = match open_decoder(id, path) {
-            Ok(d) => d,
-            Err(e) => {
-                self.stop();
-                self.emit(Event::Error {
-                    id,
-                    message: format!("{e:#}"),
-                });
-                return;
-            }
-        };
-        if start_ms > 0 {
-            dec.seek(start_ms);
-        }
+    fn play(&mut self, id: u64, stream: &Stream, start_ms: u64) {
+        self.cur = None;
         self.next = None;
         self.reopen = None;
         self.draining = false;
         self.pend.clear();
         self.pend_pos = 0;
         self.segments.clear();
+        if let Some(out) = &self.out {
+            // Don't continue playing stale buffered audio while the new
+            // HTTP response opens. The output can still be reused below.
+            out.shared
+                .paused
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (dec, base_ms) = match self.prepare(id, stream, start_ms) {
+            Ok(d) if !cancelled(&self.playback) => d,
+            Ok(_) => return,
+            Err(e) => {
+                self.fail(id, format!("{e:#}"));
+                return;
+            }
+        };
 
         let reuse = self
             .out
@@ -283,7 +346,48 @@ impl Engine {
                 }
             }
         }
-        self.begin(dec, start_ms);
+        self.begin(dec, base_ms);
+    }
+
+    fn fail(&mut self, id: u64, message: String) {
+        self.stop();
+        self.emit(Event::Error { id, message });
+    }
+
+    fn prepare(&mut self, id: u64, stream: &Stream, start_ms: u64) -> Result<(Decoding, u64)> {
+        let mut dec = open_decoder(id, stream, &mut self.http, &self.playback)?;
+        if start_ms == 0 {
+            return Ok((dec, 0));
+        }
+        if dec.http_seekable == Some(false) {
+            // Don't discard an arbitrarily long prefix to simulate a seek.
+            tracing::warn!(
+                item = id,
+                "HTTP audio has no byte ranges; restarting at the beginning"
+            );
+            return Ok((dec, 0));
+        }
+        match dec.seek(start_ms) {
+            Ok(()) => Ok((dec, start_ms)),
+            Err(e) if dec.http_seekable.is_none() => {
+                tracing::warn!("seek failed: {e}");
+                Ok((dec, start_ms))
+            }
+            Err(e)
+                if matches!(e, SymError::SeekError(_))
+                    || matches!(&e, SymError::IoError(e) if e.kind() == std::io::ErrorKind::Unsupported) =>
+            {
+                tracing::warn!(
+                    item = id,
+                    "HTTP audio seek unsupported; restarting at the beginning"
+                );
+                // A demuxer may consume bytes before deciding it cannot seek.
+                drop(dec);
+                Ok((open_decoder(id, stream, &mut self.http, &self.playback)?, 0))
+            }
+            Err(SymError::IoError(e)) => Err(e).context("HTTP audio seek failed"),
+            Err(_) => anyhow::bail!("HTTP audio seek failed"),
+        }
     }
 
     /// Make `dec` the decoding track, starting at the current write position.
@@ -303,13 +407,13 @@ impl Engine {
     /// Current track hit EOF: roll into `next` if there is one.
     fn advance(&mut self) {
         self.cur = None;
-        let Some((id, path)) = self.next.take() else {
+        let Some((id, stream)) = self.next.take() else {
             self.draining = true;
             return;
         };
         self.draining = false;
-        match open_decoder(id, &path) {
-            Ok(dec) => {
+        match open_decoder(id, &stream, &mut self.http, &self.playback) {
+            Ok(dec) if !cancelled(&self.playback) => {
                 let out = self.out.as_ref().expect("output open");
                 if out.rate == dec.rate && channels_ok(out.channels, dec.channels) {
                     self.begin(dec, 0);
@@ -317,6 +421,7 @@ impl Engine {
                     self.reopen = Some(dec);
                 }
             }
+            Ok(_) => {}
             Err(e) => {
                 self.draining = true;
                 self.emit(Event::Error {
@@ -329,6 +434,18 @@ impl Engine {
 
     /// Move decoded audio into the ring. Returns true if anything happened.
     fn pump(&mut self) -> bool {
+        if cancelled(&self.playback) {
+            return false;
+        }
+        // Publish an audible transition before a subsequent packet read can
+        // block waiting on the network. Do not wait for the pump batch to end.
+        if self.segments.front().is_some_and(|seg| {
+            self.out.as_ref().is_some_and(|out| {
+                out.written > seg.start_sample && out.consumed() >= seg.start_sample
+            })
+        }) {
+            self.tick();
+        }
         let Some(out) = self.out.as_mut() else {
             return false;
         };
@@ -344,7 +461,14 @@ impl Engine {
             self.advance();
             return true;
         }
-        match dec.format.next_packet() {
+        if out.prod.slots() < out.channels {
+            return false;
+        }
+        let packet = dec.format.next_packet();
+        if cancelled(&self.playback) {
+            return false;
+        }
+        match packet {
             Ok(Some(pkt)) => {
                 if pkt.track_id != dec.track_id {
                     return true;
@@ -374,6 +498,15 @@ impl Engine {
                 dec.eof = true
             }
             Err(SymError::ResetRequired) => dec.eof = true,
+            Err(e) if dec.http_seekable.is_some() => {
+                let id = dec.id;
+                let message = match e {
+                    SymError::IoError(e) => format!("HTTP audio read failed: {e}"),
+                    _ => "HTTP audio demux failed".into(),
+                };
+                self.fail(id, message);
+                return false;
+            }
             Err(e) => {
                 tracing::warn!("demux failed: {e}");
                 dec.eof = true;
@@ -384,6 +517,9 @@ impl Engine {
 
     /// Announce boundaries that became audible; finish when drained.
     fn tick(&mut self) {
+        if cancelled(&self.playback) {
+            return;
+        }
         let Some(out) = self.out.as_ref() else { return };
         let consumed = out.consumed();
         let sps = out.rate as u64 * out.channels as u64;
@@ -434,17 +570,32 @@ fn channels_ok(out: usize, src: usize) -> bool {
     out == src || (out == 2 && src <= 2)
 }
 
-fn open_decoder(id: u64, path: &Path) -> Result<Decoding> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+fn open_decoder(
+    id: u64,
+    stream: &Stream,
+    http: &mut HttpTransport,
+    playback: &Playback,
+) -> Result<Decoding> {
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
+    let (source, http_seekable): (Box<dyn MediaSource>, _) = match stream {
+        Stream::File { path } => {
+            let path = Path::new(path);
+            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                hint.with_extension(ext);
+            }
+            (Box::new(file), None)
+        }
+        Stream::Http { url, headers } => {
+            let source = http.open(url, headers, playback)?;
+            let seekable = source.is_seekable();
+            (Box::new(source), Some(seekable))
+        }
+    };
     let format = symphonia::default::get_probe()
         .probe(
             &hint,
-            mss,
+            MediaSourceStream::new(source, Default::default()),
             FormatOptions::default(),
             MetadataOptions::default(),
         )
@@ -478,25 +629,25 @@ fn open_decoder(id: u64, path: &Path) -> Result<Decoding> {
         rate,
         channels,
         duration_ms,
+        http_seekable,
         eof: false,
     })
 }
 
 impl Decoding {
-    fn seek(&mut self, ms: u64) {
-        let Some(time) = Time::try_from_secs_f64(ms as f64 / 1000.0) else {
-            return;
-        };
-        match self.format.seek(
+    fn seek(&mut self, ms: u64) -> symphonia::core::errors::Result<()> {
+        let time = Time::try_from_secs_f64(ms as f64 / 1000.0).ok_or(SymError::SeekError(
+            symphonia::core::errors::SeekErrorKind::OutOfRange,
+        ))?;
+        self.format.seek(
             SeekMode::Accurate,
             SeekTo::Time {
                 time,
                 track_id: Some(self.track_id),
             },
-        ) {
-            Ok(_) => self.decoder.reset(),
-            Err(e) => tracing::warn!("seek failed: {e}"),
-        }
+        )?;
+        self.decoder.reset();
+        Ok(())
     }
 }
 

@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -67,10 +68,21 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+            Ok(s) => Self::parse(&s).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        let cfg: Self = toml::from_str(s)?;
+        let mut names = HashSet::new();
+        for p in &cfg.plugins {
+            if !names.insert(&p.name) {
+                bail!("duplicate plugin name {:?}", p.name);
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -99,4 +111,25 @@ pub fn resolve_exec(prog: &str) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_names_are_unique_across_roles() {
+        let error = Config::parse(
+            r#"
+            [[plugin]]
+            name = "duplicate"
+            exec = ["source"]
+            [[plugin]]
+            name = "duplicate"
+            exec = ["frontend"]
+        "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate plugin name"));
+    }
 }

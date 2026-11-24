@@ -85,10 +85,16 @@ CREATE TABLE IF NOT EXISTS saved  (uri TEXT PRIMARY KEY, added_at INTEGER NOT NU
 CREATE VIRTUAL TABLE IF NOT EXISTS track_fts USING fts5(
     uri UNINDEXED, title, artists, release, tokenize = 'unicode61 remove_diacritics 2'
 );
+-- Connection-local visibility, never a durable deletion or a cache reset.
+CREATE TEMP TABLE enabled_source (name TEXT PRIMARY KEY) WITHOUT ROWID;
+INSERT INTO enabled_source SELECT name FROM main.source;
+CREATE TEMP VIEW browse_track AS
+    SELECT t.* FROM main.track t JOIN enabled_source e ON e.name = t.source;
 "#;
 
 pub struct Library {
     conn: Connection,
+    configured_sources_only: bool,
 }
 
 impl Library {
@@ -98,14 +104,20 @@ impl Library {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            configured_sources_only: false,
+        })
     }
 
     #[cfg(test)]
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            configured_sources_only: false,
+        })
     }
 
     // ── sources ──
@@ -120,7 +132,36 @@ impl Library {
              ON CONFLICT(name) DO UPDATE SET scheme = ?2, cache_mode = ?3",
             params![name, scheme, mode],
         )?;
+        if !self.configured_sources_only {
+            self.conn
+                .execute("INSERT OR IGNORE INTO enabled_source VALUES (?1)", [name])?;
+        }
         Ok(())
+    }
+
+    /// Restrict catalogue browsing without modifying durable source/track state.
+    /// Configured sources remain browseable during temporary plugin outages.
+    pub fn set_enabled_sources(&mut self, names: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM enabled_source", [])?;
+        for name in names {
+            tx.execute("INSERT OR IGNORE INTO enabled_source VALUES (?1)", [name])?;
+        }
+        tx.commit()?;
+        self.configured_sources_only = true;
+        Ok(())
+    }
+
+    /// Negotiated frontends cannot expose an old source's retained catalogue.
+    pub fn hide_source(&self, name: &str) -> Result<bool> {
+        let visible: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM browse_track WHERE source = ?1 AND stale = 0)",
+            [name],
+            |row| row.get(0),
+        )?;
+        self.conn
+            .execute("DELETE FROM enabled_source WHERE name = ?1", [name])?;
+        Ok(visible)
     }
 
     pub fn source_cursor(&self, name: &str) -> Result<Option<String>> {
@@ -186,7 +227,7 @@ impl Library {
             return Ok(vec![]);
         }
         self.tracks_for(
-            "SELECT f.uri FROM track_fts f JOIN track t ON t.uri = f.uri
+            "SELECT f.uri FROM track_fts f JOIN browse_track t ON t.uri = f.uri
              WHERE track_fts MATCH ?1 AND t.stale = 0
              ORDER BY bm25(track_fts, 0.0, 10.0, 6.0, 4.0) LIMIT ?2",
             params![expr, limit],
@@ -199,7 +240,7 @@ impl Library {
              FROM artist a
              JOIN release_artist ra ON ra.artist_id = a.id
              JOIN release r ON r.id = ra.release_id
-             WHERE EXISTS (SELECT 1 FROM track t WHERE t.release_id = r.id AND t.stale = 0)
+             WHERE EXISTS (SELECT 1 FROM browse_track t WHERE t.release_id = r.id AND t.stale = 0)
              GROUP BY a.id
              ORDER BY COALESCE(a.sort_name, a.name) COLLATE NOCASE",
         )?;
@@ -217,7 +258,7 @@ impl Library {
         let mut st = self.conn.prepare(
             "SELECT * FROM (
                SELECT r.id, r.title, r.artist_key, r.date,
-                      (SELECT COUNT(*) FROM track t WHERE t.release_id = r.id AND t.stale = 0) AS n
+                      (SELECT COUNT(*) FROM browse_track t WHERE t.release_id = r.id AND t.stale = 0) AS n
                FROM release r
                WHERE ?1 IS NULL OR EXISTS (
                  SELECT 1 FROM release_artist ra WHERE ra.release_id = r.id AND ra.artist_id = ?1)
@@ -238,7 +279,7 @@ impl Library {
 
     pub fn tracks_by_release(&self, release_id: i64) -> Result<Vec<Track>> {
         self.tracks_for(
-            "SELECT uri FROM track WHERE release_id = ?1 AND stale = 0
+            "SELECT uri FROM browse_track WHERE release_id = ?1 AND stale = 0
              ORDER BY COALESCE(disc_no, 1), track_no, title",
             [release_id],
         )
@@ -246,12 +287,20 @@ impl Library {
 
     pub fn tracks_by_artist(&self, artist_id: i64) -> Result<Vec<Track>> {
         self.tracks_for(
-            "SELECT t.uri FROM track t
+            "SELECT t.uri FROM browse_track t
              JOIN release r ON r.id = t.release_id
              JOIN release_artist ra ON ra.release_id = r.id AND ra.artist_id = ?1
              WHERE t.stale = 0
              ORDER BY r.date, r.title COLLATE NOCASE, COALESCE(t.disc_no, 1), t.track_no",
             [artist_id],
+        )
+    }
+
+    /// Stable keyset pages for frontend catalogue mirrors, including untagged tracks.
+    pub fn all_tracks(&self, limit: u32, after_uri: Option<&str>) -> Result<Vec<Track>> {
+        self.tracks_for(
+            "SELECT uri FROM browse_track WHERE stale = 0 AND uri > ?1 ORDER BY uri LIMIT ?2",
+            params![after_uri.unwrap_or(""), limit.min(1000)],
         )
     }
 
@@ -488,6 +537,166 @@ mod tests {
             track_no: Some(n),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn disabled_source_catalogue_is_hidden_without_losing_durable_data() {
+        let mut lib = Library::memory().unwrap();
+        lib.register_source("local", "local", CacheMode::Full)
+            .unwrap();
+        lib.register_source("remote", "remote", CacheMode::Full)
+            .unwrap();
+        let hidden = t("local:only", "Hidden song", "Local only", "Local album", 1);
+        lib.apply_batch(
+            "local",
+            &SyncBatch {
+                upserts: vec![
+                    hidden.clone(),
+                    t(
+                        "local:twin",
+                        "Twin local",
+                        "Shared artist",
+                        "Shared album",
+                        1,
+                    ),
+                ],
+                done: true,
+                next_cursor: Some("local-cursor".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        lib.apply_batch(
+            "remote",
+            &SyncBatch {
+                upserts: vec![t(
+                    "remote:twin",
+                    "Twin remote",
+                    "Shared artist",
+                    "Shared album",
+                    1,
+                )],
+                done: true,
+                next_cursor: Some("remote-cursor".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let shared_artist = lib
+            .artists()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "Shared artist")
+            .unwrap()
+            .id;
+        let shared_release = lib.releases(Some(shared_artist)).unwrap()[0].id;
+        let play = lib.play_start(&hidden).unwrap();
+        lib.play_finish(play, 1000, true).unwrap();
+        lib.conn
+            .execute("INSERT INTO rating VALUES (?1, 5)", [&hidden.uri])
+            .unwrap();
+        lib.conn
+            .execute("INSERT INTO saved VALUES (?1, 1)", [&hidden.uri])
+            .unwrap();
+
+        let queue_metadata = lib.track(&hidden.uri).unwrap();
+        lib.set_enabled_sources(&["remote".into()]).unwrap();
+        assert!(lib.search("Hidden", 10).unwrap().is_empty());
+        assert_eq!(lib.search("Twin", 10).unwrap()[0].uri, "remote:twin");
+        assert_eq!(lib.search("Twin", 10).unwrap().len(), 1);
+        assert_eq!(lib.all_tracks(10, None).unwrap().len(), 1);
+        assert_eq!(lib.artists().unwrap().len(), 1);
+        let releases = lib.releases(None).unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].tracks, 1);
+        assert_eq!(
+            lib.tracks_by_artist(shared_artist).unwrap()[0].uri,
+            "remote:twin"
+        );
+        assert_eq!(lib.tracks_by_artist(shared_artist).unwrap().len(), 1);
+        assert_eq!(
+            lib.tracks_by_release(shared_release).unwrap()[0].uri,
+            "remote:twin"
+        );
+        assert_eq!(lib.tracks_by_release(shared_release).unwrap().len(), 1);
+
+        // Explicit queue lookups and historical snapshots must still work.
+        assert_eq!(lib.track(&hidden.uri).unwrap(), queue_metadata);
+        assert_eq!(lib.history(10).unwrap()[0].track, hidden);
+        assert_eq!(
+            lib.source_cursor("local").unwrap().as_deref(),
+            Some("local-cursor")
+        );
+        assert_eq!(lib.source_track_count("local").unwrap(), 2);
+        assert_eq!(
+            lib.conn
+                .query_row("SELECT value FROM rating", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            lib.conn
+                .query_row("SELECT COUNT(*) FROM saved", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            lib.conn
+                .query_row("SELECT COUNT(*) FROM track WHERE stale = 0", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(lib.conn.query_row("SELECT COUNT(*) FROM main.sqlite_master WHERE name IN ('enabled_source','browse_track')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+        lib.set_enabled_sources(&[]).unwrap();
+        assert!(lib.all_tracks(10, None).unwrap().is_empty());
+        assert!(lib.artists().unwrap().is_empty());
+        assert!(lib.releases(None).unwrap().is_empty());
+        lib.set_enabled_sources(&["local".into()]).unwrap();
+        // No resync is needed to restore previously cached tracks.
+        assert_eq!(lib.all_tracks(10, None).unwrap().len(), 2);
+        lib.register_source("remote", "remote", CacheMode::Full)
+            .unwrap();
+        assert_eq!(lib.all_tracks(10, None).unwrap().len(), 2);
+        assert!(lib.hide_source("local").unwrap());
+        assert!(!lib.hide_source("local").unwrap());
+        assert!(lib.all_tracks(10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalogue_pages_use_uri_order_and_exclude_stale_tracks() {
+        let mut lib = Library::memory().unwrap();
+        lib.register_source("test", "test", CacheMode::Full)
+            .unwrap();
+        lib.apply_batch(
+            "test",
+            &SyncBatch {
+                upserts: vec![
+                    Track {
+                        uri: "test:c".into(),
+                        title: "untagged".into(),
+                        ..Default::default()
+                    },
+                    t("test:a", "first", "artist", "album", 1),
+                    t("test:b", "deleted", "artist", "album", 2),
+                    t("test:d", "last", "artist", "album", 3),
+                ],
+                deletes: vec!["test:b".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = lib.all_tracks(2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|t| t.uri.as_str()).collect::<Vec<_>>(),
+            ["test:a", "test:c"]
+        );
+        let last = lib.all_tracks(2, Some(&first[1].uri)).unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].uri, "test:d");
+        assert!(lib.all_tracks(2, Some("test:d")).unwrap().is_empty());
+        assert!(lib.all_tracks(0, None).unwrap().is_empty());
     }
 
     #[test]

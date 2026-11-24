@@ -36,6 +36,7 @@ enum Cmd {
     Prev,
     /// Seek to seconds, or relative with +N / -N.
     Seek {
+        #[arg(allow_negative_numbers = true)]
         to: String,
     },
     /// Volume 0–150 (percent).
@@ -219,4 +220,22 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seek_accepts_absolute_and_signed_seconds() {
+        for value in ["90", "+10", "-10", "-0.5"] {
+            let cli = Cli::try_parse_from(["lark", "seek", value]).unwrap();
+            assert!(matches!(cli.cmd, Some(Cmd::Seek { to }) if to == value));
+        }
+    }
+
+    #[test]
+    fn seek_still_rejects_unknown_options() {
+        assert!(Cli::try_parse_from(["lark", "seek", "--unknown"]).is_err());
+    }
 }

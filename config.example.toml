@@ -11,6 +11,28 @@ exec = ["lark-source-local"]           # bare names resolve next to larkd, then 
 [plugin.config]
 music_dir = "~/Music"
 
+# Navidrome (no pip dependencies). Nix package: exec = ["lark-source-navidrome"].
+# For checkout development, use an absolute script path as below;
+# larkd inherits NAVIDROME_PASSWORD from its environment. See plugins/navidrome/README.md.
+# [[plugin]]
+# name = "navidrome"
+# exec = ["python3", "/absolute/path/to/lark/plugins/navidrome/lark_source_navidrome.py"]
+# [plugin.config]
+# url = "https://music.example.com"  # include any server base path, not /rest
+# username = "your-user"
+# password_env = "NAVIDROME_PASSWORD"
+# page_size = 500                  # songs per bulk catalogue page, 1..500
+# allow_http = false               # opt in only for trusted local HTTP servers
+
+# MPD frontend: optional, local unauthenticated compatibility endpoint for rmpc.
+# Nix package: exec = ["lark-frontend-mpd"].
+# [[plugin]]
+# name = "mpd"
+# exec = ["python3", "/absolute/path/to/lark/plugins/mpd/lark_frontend_mpd.py"]
+# [plugin.config]
+# host = "127.0.0.1"
+# port = 6600
+
 # Any executable that speaks the plugin protocol over stdio works:
 # [[plugin]]
 # name = "radio"
